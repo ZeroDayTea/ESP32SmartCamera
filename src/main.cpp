@@ -1,13 +1,18 @@
+#include <stdarg.h>
+#include <stdio.h>
 #include <WiFi.h>
 #include <ESP32_FTPClient.h>
 #include <esp_camera.h>
 #include "config.h"
 #include <esp_sntp.h>
+#include <esp_log.h>
+#include <esp32-hal-log.h>
 #include <HardwareSerial.h>
 #include <StreamDebugger.h>
 #include <TinyGsmClient.h>
 #include <SPI.h>
 #include <SD.h>
+#include <FS.h>
 
 // configurations defined in config.h
 ESP32_FTPClient ftp (FTP_SERVER, FTP_USER, FTP_PASS, 20000);
@@ -19,6 +24,7 @@ ESP32_FTPClient ftp (FTP_SERVER, FTP_USER, FTP_PASS, 20000);
 #else
   TinyGsm modem(SerialAT);
 #endif
+File log_file;
 String IMEI = "";
 String GPSPosition = "";
 String LogContent = "";
@@ -41,7 +47,7 @@ void getIMEI();
 void syncTime();
 void initializeModem();
 void initializeSDCard();
-void LogMessage(String msg);
+int sdCardLogOutput(const char *format, va_list args);
 
 // datetime as string of numbers
 String getCurrentDateTime() {
@@ -84,7 +90,7 @@ String getSDCardInfo() {
 void takePhoto() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
-    LogMessage("Camera capture failed");
+    ESP_LOGI(TAG, "Camera capture failed");
     return;
   }
   else {
@@ -104,8 +110,8 @@ void takePhoto() {
   // return the frame buffer back to the driver for reuse
   esp_camera_fb_return(fb);
 
-  LogMessage("Time: " + String(esp_timer_get_time()));
-  LogMessage("Photo taken and uploaded successfully");
+  ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()));
+  ESP_LOGI(TAG, "Photo taken and uploaded successfully");
   sendTimes += 1;
 }
 
@@ -125,37 +131,36 @@ void sendLogFile() {
   LogContent += "Send:" + String(sendTimes) + "\n";
   LogContent += "GPS:" + GPSPosition + "\n";
 
-  LogMessage("Log Content:\n" + LogContent);
+  ESP_LOGI(TAG, "Log Content:\n%s", LogContent.c_str());
 
   ftp.OpenConnection();
-  ftp.InitFile("Type A");
+  ftp.InitFile("Type I");
   ftp.ChangeWorkDir("/");
   String fileName = getFormattedReportName();
-  LogMessage("Log filename: " + fileName);
   ftp.NewFile(fileName.c_str());
-  ftp.Write(LogContent.c_str());
+  unsigned char *data = (unsigned char *)LogContent.c_str();
+  ftp.WriteData(data, LogContent.length());
   ftp.CloseFile();
   ftp.CloseConnection();
 
-  LogMessage("Time: " + String(esp_timer_get_time()));
-  LogMessage("Daily report generated and uploaded successfully");
+  ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()).c_str());
+  ESP_LOGI(TAG, "Daily report generated and uploaded successfully");
 }
 
 // connect to WiFi
 void initializeConnectionWifi() {
-  LogMessage("Connecting to WiFi...");
+  ESP_LOGI(TAG, "Connecting to WiFi...");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
     delay(1000);
-    LogMessage(".");
+    ESP_LOGI(TAG, "Connecting to WiFi...");
   }
-  LogMessage("");
-  LogMessage("Connected to WiFi");
+  ESP_LOGI(TAG, "Connected to WiFi");
 }
 
 // initialize the camera
 void initializeCamera() {
-  LogMessage("Initializing camera...");
+  ESP_LOGI(TAG, "Initializing camera...");
 
   // camera settings
   camera_config_t config;
@@ -199,26 +204,26 @@ void initializeCamera() {
   // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
+    ESP_LOGI(TAG, "Camera init failed with error 0x%x", err);
     return;
   }
-
 
 // #ifdef CAM_IR_PIN
 //   // test IR Filter
 //   pinMode(CAM_IR_PIN, OUTPUT);
-//   LogMessage("Test IR Filter");
+//   ESP_LOGI(TAG, "Test IR Filter");
 //   int i = 3;
 //   while (i--) {
 //     digitalWrite(CAM_IR_PIN, 1 - digitalRead(CAM_IR_PIN)); delay(1000);
 //   }
 // #endif
 
-  LogMessage("IR Filter Off");
+  // TODO: on during the day, off during the night
+  ESP_LOGI(TAG, "IR Filter Off");
   pinMode(CAM_IR_PIN, OUTPUT);
   digitalWrite(CAM_IR_PIN, LOW);
 
-  LogMessage("Camera initialized");
+  ESP_LOGI(TAG, "Camera initialized");
 }
 
 // convert ddmm.mmmmmm GPS position to DMS
@@ -237,28 +242,27 @@ String convertToDMS(String coord, String direction) {
 
 // enables GNSS and gathers position data
 void getGPSPosition() {
-    LogMessage("Enabling GPS/GNSS/GLONASS and gathering position data");
+    ESP_LOGI(TAG, "Enabling GPS/GNSS/GLONASS and gathering position data");
 
     modem.sendAT("+CGPS=1"); // enable GPS
     if (modem.waitResponse(10000) != 1) {
-        LogMessage("Failed to enable GPS");
+        ESP_LOGI(TAG, "Failed to enable GPS");
         return;
     }
 
     String gps_latitude = "";
     String gps_longitude = "";
     while (true) {
-        LogMessage("Requesting GPS info");
+        ESP_LOGI(TAG, "Requesting GPS info");
 
         modem.sendAT("+CGNSSINFO");
         String response = modem.stream.readStringUntil('\n');
-        LogMessage(response);
+        ESP_LOGI(TAG, "%s", response.c_str());
 
         if (response.indexOf(",N,") != -1 || response.indexOf(",S,") != -1) {
             int latStart = response.indexOf(",", 22) + 1;
             int latEnd = response.indexOf(",", latStart);
             gps_latitude = response.substring(latStart, latEnd);
-            LogMessage(gps_latitude);
 
             int latDirEnd = response.indexOf(",", latEnd + 1);
             String latDir = response.substring(latEnd + 1, latDirEnd);
@@ -266,7 +270,6 @@ void getGPSPosition() {
             int lonStart = response.indexOf(",", latDirEnd) + 1;
             int lonEnd = response.indexOf(",", lonStart);
             gps_longitude = response.substring(lonStart, lonEnd);
-            LogMessage(gps_longitude);
 
             int lonDirEnd = response.indexOf(",", lonEnd + 1);
             String lonDir = response.substring(lonEnd + 1, lonDirEnd);
@@ -275,10 +278,10 @@ void getGPSPosition() {
             String longitudeDMS = convertToDMS(gps_longitude, lonDir);
 
             GPSPosition = latitudeDMS + " " + longitudeDMS;
-            LogMessage("GPS Position: " + GPSPosition);
+            ESP_LOGI(TAG, "GPS Position: %s", GPSPosition.c_str());
             break;
         } else {
-            LogMessage("Couldn't get GPS info, retrying in 10s.");
+            ESP_LOGI(TAG, "Couldn't get GPS info, retrying in 10s.");
             delay(15000);
         }
     }
@@ -286,34 +289,33 @@ void getGPSPosition() {
 
 // get IMEI number from GSM module
 void getIMEI() {
-  LogMessage("Updating IMEI");
+  ESP_LOGI(TAG, "Updating IMEI");
   modem.sendAT("+CGSN");
   String IMEI_buf = "";
   if (modem.waitResponse(10000, IMEI_buf) != 1) {
-    LogMessage("Failed to get IMEI");
+    ESP_LOGI(TAG, "Failed to get IMEI");
     return;
   }
   IMEI = IMEI_buf.substring(2, 17); // parse AT command response
-  LogMessage("IMEI: " + IMEI);
+  ESP_LOGI(TAG, "IMEI: %s", IMEI.c_str());
 }
 
 // ensure time is set
 void syncTime() {
-  LogMessage("Syncing Time...");
+  ESP_LOGI(TAG, "Syncing Time...");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   setenv("TZ", "UTC-2", 1); // UTC+2
   tzset();
   while (time(nullptr) < 8 * 3600 * 2) { // wait for time to be set
     delay(500);
-    LogMessage(".");
+    ESP_LOGI(TAG, "Syncing Time...");
   }
-  LogMessage("");
-  LogMessage("Time synced");
+  ESP_LOGI(TAG, "Time synced");
 }
 
 // initiale the T-PCIE modem
 void initializeModem() {
-  LogMessage("Initializing modem...");
+  ESP_LOGI(TAG, "Initializing modem...");
   pinMode(PCIE_PWR_PIN, OUTPUT);
   digitalWrite(PCIE_PWR_PIN, HIGH);
   delay(300);
@@ -321,77 +323,63 @@ void initializeModem() {
   delay(3000);
   SerialAT.begin(115200, SERIAL_8N1, PCIE_RX_PIN, PCIE_TX_PIN);
   while(!modem.init()) {
-    LogMessage("Failed to restart modem, delaying 3s and retrying");
+    ESP_LOGI(TAG, "Failed to restart modem, delaying 3s and retrying");
     delay(3000);
   }
   delay(3000);
-  LogMessage("Initialized modem");
+  ESP_LOGI(TAG, "Initialized modem");
 
   // set to GSM mode
   modem.sendAT("+CNMP=38");
   if (modem.waitResponse(10000) != 1) {
-    LogMessage("setNetworkMode to GSM failed");
+    ESP_LOGI(TAG, "setNetworkMode to GSM failed");
     return ;
   }
+}
+
+// log messages to SD card
+int sdCardLogOutput(const char *format, va_list args) {
+	char buf[128];
+	int ret = vsnprintf(buf, sizeof(buf), format, args);
+  if (log_file) {
+    Serial.println(buf);
+    log_file.print(buf);
+    log_file.flush();
+  }
+	return ret;
 }
 
 // initialize the SD card
 void initializeSDCard() {
   SPI.begin(SD_SCLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   if (!SD.begin(SD_CS_PIN)) {
-    LogMessage("Card Mount Failed");
+    ESP_LOGE(TAG, "Card Mount Failed");
     return;
   }
   uint8_t cardType = SD.cardType();
-
   if (cardType == CARD_NONE) {
-    LogMessage("No SD card attached");
+    ESP_LOGE(TAG, "No SD card attached");
     return;
   }
 
-  LogMessage("Initialized SD Card Type: ");
+  ESP_LOGI(TAG, "Initialized SD Card Type: ");
   if (cardType == CARD_MMC) {
-    LogMessage("MMC");
+    ESP_LOGI(TAG, "MMC");
   } else if (cardType == CARD_SD) {
-    LogMessage("SDSC");
+    ESP_LOGI(TAG, "SDSC");
   } else if (cardType == CARD_SDHC) {
-    LogMessage("SDHC");
+    ESP_LOGI(TAG, "SDHC");
   } else {
-    LogMessage("UNKNOWN");
+    ESP_LOGI(TAG, "UNKNOWN");
   }
 
-  File log_file = SD.open(LOG_FILE_NAME, FILE_WRITE);
-  if (log_file.print("Created log file")) {
-    LogMessage("Created log file");
+  log_file = SD.open(LOG_FILE_NAME, FILE_APPEND);
+  if (!log_file) {
+    ESP_LOGE(TAG, "Failed to open log file");
   } else {
-    LogMessage("Create log file failed");
+    ESP_LOGI(TAG, "Using SD card callback for logging");
+    esp_log_set_vprintf(sdCardLogOutput);
   }
-  log_file.close();
-
-  File log_file_read = SD.open(LOG_FILE_NAME);
-  if (!log_file_read) {
-    Serial.println("Failed to open file for reading");
-    return;
-  }
-  Serial.print("Read from file: ");
-  while (log_file_read.available()) {
-    Serial.write(log_file_read.read());
-  }
-  log_file_read.close();
-}
-
-// log message to SD card
-void LogMessage(String msg) {
-  Serial.println(msg);
-  File log_file = SD.open(LOG_FILE_NAME, FILE_APPEND);
-  if(!log_file) {
-    Serial.println("Failed to open log file for writing");
-    return;
-  }
-  if(!log_file.print(msg)) {
-    Serial.println("Failed to write to log file");
-  }
-  log_file.close();
 }
 
 void setup() {
@@ -400,10 +388,12 @@ void setup() {
   delay(100);
   Serial.begin(115200);
   delay(10);
+  esp_log_level_set("*", ESP_LOG_VERBOSE);
+  esp_log_level_set(TAG, ESP_LOG_VERBOSE);
 
   initializeSDCard();
 
-  LogMessage("Starting camera sensor...");
+  ESP_LOGI(TAG, "Starting camera sensor...");
 
   initializeConnectionWifi();
 
@@ -416,7 +406,6 @@ void setup() {
   syncTime();
 
   // sendLogFile();
-  // takePhoto();
 }
 
 void loop() {
@@ -424,8 +413,8 @@ void loop() {
   static unsigned long lastReportTime = 0;
   unsigned long currentTime = millis();
 
- if (currentTime - lastPhotoTime >= 300000) { // 5 minutes
-   // takePhoto();
+ if (currentTime - lastPhotoTime >= 600000) { // 10 minutes
+    takePhoto();
     lastPhotoTime = currentTime;
   }
 

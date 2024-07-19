@@ -4,6 +4,7 @@
 #include <ESP32_FTPClient.h>
 #include <esp_camera.h>
 #include "config.h"
+#include "secrets.h"
 #include <esp_sntp.h>
 #include <esp_log.h>
 #include <esp32-hal-log.h>
@@ -13,6 +14,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
+#include <Preferences.h>
 
 // configurations defined in config.h
 ESP32_FTPClient ftp (FTP_SERVER, FTP_USER, FTP_PASS, 20000);
@@ -28,8 +30,7 @@ File log_file;
 String IMEI = "";
 String GPSPosition = "";
 String LogContent = "";
-int totalPictures = 0;
-int sendTimes = 0;
+Preferences preferences;
 
 // function prototypes
 String getCurrentDateTime();
@@ -48,6 +49,10 @@ void syncTime();
 void initializeModem();
 void initializeSDCard();
 int sdCardLogOutput(const char *format, va_list args);
+
+void stopFtp(void);
+String sendATcommand(String toSend, String expectedResponse, unsigned long milliseconds);
+String readLineFromSerial(String stringToRead, unsigned long timeoutMilis);
 
 // datetime as string of numbers
 String getCurrentDateTime() {
@@ -86,6 +91,133 @@ String getSDCardInfo() {
   return sdInfo;
 }
 
+// start FTP service on modem and login
+boolean initFtp(void) {
+  modem.sendAT("+CFTPSSTART");
+  while(modem.stream.available()) {
+    String response = modem.stream.readStringUntil('\n');
+    if(response.indexOf("ERROR") != -1) {
+      ESP_LOGI(TAG, "Failed to initialize FTP");
+      return false;
+    }
+  }
+
+  delay(1000);
+
+  String loginCommand = String("+CFTPSLOGIN=")
+     + "\"" + FTP_SERVER + "\""
+     + "," + String(FTP_PORT)
+     + ","+ "\"" + FTP_USER + "@" + FTP_SERVER + "\""
+     + ","+ "\"" + FTP_PASS + "\""
+     + ",0";
+  modem.sendAT(loginCommand);
+  while(modem.stream.available()) {
+    String response = modem.stream.readStringUntil('\n');
+    if(response.indexOf("ERROR") != -1) {
+      ESP_LOGI(TAG, "Failed to login FTP");
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// logout and stop FTP service on modem
+void stopFtp(void){
+  modem.sendAT("+CFTPSLOGOUT");
+  if (modem.waitResponse(20000) != 1) {
+    ESP_LOGI(TAG, "Failed to logout FTP");
+  }
+  modem.sendAT("+CFTPSSTOP");
+  if (modem.waitResponse(20000) != 1) {
+    ESP_LOGI(TAG, "Failed to stop FTP");
+  }
+}
+
+// send file to FTP server (must be logged in first)
+int sendFileToFtp(String imageFileName){
+  String putCommand = String("+CFTPSPUTFILE=") + "\"" + imageFileName + "\"," + "3";
+  modem.sendAT(putCommand);
+  if (modem.waitResponse(20000) != 1) {
+    ESP_LOGI(TAG, "Failed to run putfile");
+  }
+
+  return 0;
+}
+
+// copy camera data to modem EFS sd card
+boolean sendFileToEFS(String imageFileName, camera_fb_t * fb) {
+  uint8_t *fbBuf = fb->buf;
+  size_t len = fb->len;
+
+  modem.sendAT("+FSCD=E:");
+  if (modem.waitResponse(20000) != 1) {
+    ESP_LOGI(TAG, "Failed to switch EFS directory");
+  }
+
+  ESP_LOGI(TAG, "File length: %d", len);
+  String uploadCommand = "+CFTRANRX=";
+  uploadCommand = uploadCommand + "\"e:/" + imageFileName + "\"," + len;
+  ESP_LOGI(TAG, "upload command: %s", uploadCommand.c_str());
+  modem.sendAT(uploadCommand);
+  if (modem.waitResponse(5000) != 1) { // TODO: fix waiting for the '>' start
+    // ESP_LOGI(TAG, "Failed to start file upload to EFS");
+  }
+
+  modem.stream.write(fbBuf, len);
+  modem.stream.flush();
+  // Wait for the OK response
+  unsigned long startTime = millis();
+  while (millis() - startTime < 15000) { // Adjust the timeout as necessary
+    if (modem.stream.available()) {
+      String response = modem.stream.readStringUntil('\n');
+      ESP_LOGI(TAG, "Response: %s", response.c_str());
+      if (response.indexOf("OK") != -1) {
+        ESP_LOGI(TAG, "File successfully written to EFS");
+
+        // manual check that file was written
+        modem.sendAT("+FSLS");
+        if (modem.waitResponse(20000) != 1) {
+          ESP_LOGI(TAG, "Failed to check EFS directory");
+        }
+        return true;
+      }
+    }
+  }
+
+  ESP_LOGI(TAG, "Failed to write file to EFS");
+  return false;
+}
+
+// copy file to modem and send it to FTP server
+boolean sendPhoto(camera_fb_t * fb){
+  String imageFileName = getFormattedImageName();
+  if (!sendFileToEFS(imageFileName, fb)){
+    ESP_LOGI(TAG, "Error while sending file to EFS. Is SD card ok ?");
+    return false;
+  };
+  if (!initFtp()) {
+    ESP_LOGI(TAG, "Error while conecting to FTP");
+    return false;
+  };
+  // int ftpResult = -1;
+  // int retries = 3;
+  // while (ftpResult != 0 && retries >= 0) {
+  //   ftpResult = sendFileToFtp(imageFileName);
+  //   retries--;
+  //   if(ftpResult != 0){
+  //     ESP_LOGI(TAG, "Error sending file to FTP, retrying, number of retires left : %d", retries);
+  //   }
+  // }
+  // stopFtp();
+  // if (ftpResult == 0){
+  //   return true;
+  // } else {
+  //   ESP_LOGI(TAG, "Cannot send file to FTP");
+  //   return false;
+  // }
+}
+
 // take photo, process it, and send to server if needed
 void takePhoto() {
   camera_fb_t *fb = esp_camera_fb_get();
@@ -94,31 +226,58 @@ void takePhoto() {
     return;
   }
   else {
-    totalPictures += 1;
+    unsigned int totalPictures = preferences.getUInt("totalPictures", 0);
+    totalPictures++;
+    preferences.putUInt("totalPictures", totalPictures);
+
+    ESP_LOGI(TAG, "Total Pictures: %d", totalPictures);
   }
 
-  // send to FTP server
-  ftp.OpenConnection();
-  ftp.InitFile("Type I");
-  ftp.ChangeWorkDir("/");
-  String filename = getFormattedImageName();
-  ftp.NewFile(filename.c_str());
-  ftp.WriteData(fb->buf, fb->len);
-  ftp.CloseFile();
-  ftp.CloseConnection();
+  // send to FTP server over WIFI
+  // ftp.OpenConnection();
+  // ftp.InitFile("Type I");
+  // ftp.ChangeWorkDir("/");
+  // String filename = getFormattedImageName();
+  // ftp.NewFile(filename.c_str());
+  // ftp.WriteData(fb->buf, fb->len);
+  // ftp.CloseFile();
+  // ftp.CloseConnection();
+
+  // send to FTP server over GSM
+  boolean sendPhotoOk = false;
+  for (int i=0; i<3; i++) {
+    sendPhotoOk = sendPhoto(fb);
+    if (sendPhotoOk) {
+      break;
+    }
+  }
+
+  if (!sendPhotoOk) {
+    ESP_LOGI(TAG, "Cannot send file to FTP");
+    esp_camera_fb_return(fb);
+    return;
+  }
 
   // return the frame buffer back to the driver for reuse
   esp_camera_fb_return(fb);
 
   ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()));
   ESP_LOGI(TAG, "Photo taken and uploaded successfully");
-  sendTimes += 1;
+
+  unsigned int sendTimes = preferences.getUInt("sendTimes", 0);
+  sendTimes++;
+  preferences.putUInt("sendTimes", sendTimes);
+
+  ESP_LOGI(TAG, "Send Times: %d", sendTimes);
 }
 
 // send formatted logfile with sensor information
 void sendLogFile() {
   String formattedDateTime = getFormattedDateTime();
   getGPSPosition(); // update GPS position data
+
+  unsigned int sendTimes = preferences.getUInt("sendTimes", 0);
+  unsigned int totalPictures = preferences.getUInt("totalPictures", 0);
 
   LogContent = "IMEI:" + IMEI + "\n";
   LogContent += "CSQ:12\n";
@@ -184,9 +343,10 @@ void initializeCamera() {
   config.pin_reset = CAM_RESET_PIN;
   config.xclk_freq_hz = 20000000; // EXPERIMENTAL: Set to 16MHz on ESP32-S2 or ESP32-S3 to enable EDMA mode
   config.pixel_format = PIXFORMAT_JPEG; // YUV422,GRAYSCALE,RGB565,JPEG
+  // config.vertical_flip = false;
 
   if (psramFound()) {
-      config.frame_size = FRAMESIZE_QHD; // change for better resolution. do not go above QVGA size when not jpeg
+      config.frame_size = FRAMESIZE_XGA; // change for better resolution. do not go above QVGA size when not jpeg
       config.jpeg_quality = 10; // 0-63 with lower number is better quality
       config.fb_count = 2;
   } else {
@@ -326,14 +486,24 @@ void initializeModem() {
     ESP_LOGI(TAG, "Failed to restart modem, delaying 3s and retrying");
     delay(3000);
   }
-  delay(3000);
   ESP_LOGI(TAG, "Initialized modem");
+
+  // register network
+  // String result;
+  // while(true) {
+  //   Serial.println("Waiting for network...");
+  //   result = sendATcommand("AT+CREG?","+CREG: 0,1", 5000);
+  //   if (result.indexOf("+CREG: 0,1") > 0) {
+  //     break;
+  //   }
+  //   delay(2000);
+  // }
 
   // set to GSM mode
   modem.sendAT("+CNMP=38");
   if (modem.waitResponse(10000) != 1) {
     ESP_LOGI(TAG, "setNetworkMode to GSM failed");
-    return ;
+    return;
   }
 }
 
@@ -386,6 +556,7 @@ void setup() {
   pinMode(PWR_ON_PIN, OUTPUT);
   digitalWrite(PWR_ON_PIN, HIGH);
   delay(100);
+  Serial2.begin(115200, SERIAL_8N1, PCIE_RX_PIN, PCIE_TX_PIN);
   Serial.begin(115200);
   delay(10);
   esp_log_level_set("*", ESP_LOG_VERBOSE);
@@ -394,6 +565,9 @@ void setup() {
   initializeSDCard();
 
   ESP_LOGI(TAG, "Starting camera sensor...");
+
+  // initialize NVME
+  preferences.begin("image-data", false);
 
   initializeConnectionWifi();
 
@@ -406,6 +580,7 @@ void setup() {
   syncTime();
 
   // sendLogFile();
+  // takePhoto();
 }
 
 void loop() {
@@ -413,15 +588,15 @@ void loop() {
   static unsigned long lastReportTime = 0;
   unsigned long currentTime = millis();
 
- if (currentTime - lastPhotoTime >= 600000) { // 10 minutes
+ if (currentTime - lastPhotoTime >= 60000) { // 10 minutes = 600000
     takePhoto();
     lastPhotoTime = currentTime;
   }
 
-  // if (currentTime - lastReportTime >= 86400000) { // 24 hours
-  //   sendLogFile();
-  //   lastReportTime = currentTime;
-  // }
+  if (currentTime - lastReportTime >= 86400000) { // 24 hours
+    sendLogFile();
+    lastReportTime = currentTime;
+  }
 
-  delay(1000);
+  delay(5000);
 }

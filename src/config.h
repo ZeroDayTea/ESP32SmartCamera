@@ -6,7 +6,7 @@
 #define TAG "SmartCamera"
 
 #define SerialAT Serial1
-// #define DUMP_AT_COMMANDS
+#define DUMP_AT_COMMANDS
 #define GSM_BAUD 9600
 #define TINY_GSM_MODEM_SIM7600
 #define GNSS_MODE 2

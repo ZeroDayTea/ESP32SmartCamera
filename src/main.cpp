@@ -93,30 +93,39 @@ String getSDCardInfo() {
 
 // start FTP service on modem and login
 boolean initFtp(void) {
+  String result;
+
   modem.sendAT("+CFTPSSTART");
-  while(modem.stream.available()) {
-    String response = modem.stream.readStringUntil('\n');
-    if(response.indexOf("ERROR") != -1) {
-      ESP_LOGI(TAG, "Failed to initialize FTP");
-      return false;
-    }
+  modem.waitResponse(2000);
+  if(modem.waitResponse(10000) != 0) {
+    ESP_LOGI(TAG, "Failed to start FTP service on modem");
+    return false;
+  }
+  else {
+    ESP_LOGI(TAG, "Started FTP service on modem");
   }
 
-  delay(1000);
+  modem.sendAT("+CFTPSLOGIN=\"", FTP_SERVER, ("\","), FTP_PORT,(",\""), FTP_USER,("\",\""), FTP_PASS,("\","),0);
+  if (modem.waitResponse(2000) != 1) {
+    ESP_LOGI(TAG, "Failed to login FTP");
+    return false;
+  }
+  else {
+    ESP_LOGI(TAG, "Logged in FTP");
+  }
 
-  String loginCommand = String("+CFTPSLOGIN=")
-     + "\"" + FTP_SERVER + "\""
-     + "," + String(FTP_PORT)
-     + ","+ "\"" + FTP_USER + "@" + FTP_SERVER + "\""
-     + ","+ "\"" + FTP_PASS + "\""
-     + ",0";
-  modem.sendAT(loginCommand);
-  while(modem.stream.available()) {
-    String response = modem.stream.readStringUntil('\n');
-    if(response.indexOf("ERROR") != -1) {
-      ESP_LOGI(TAG, "Failed to login FTP");
-      return false;
-    }
+  modem.sendAT("+CFTPTYPE=I");
+  modem.waitResponse(2000, result);
+  ESP_LOGI(TAG, "%s", result.c_str());
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to set FTP type");
+  }
+
+  modem.sendAT("+CFTPSCWD=\"/\"");
+  modem.waitResponse(2000, result);
+  ESP_LOGI(TAG, "%s", result.c_str());
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to set FTP folder");
   }
 
   return true;
@@ -136,7 +145,7 @@ void stopFtp(void){
 
 // send file to FTP server (must be logged in first)
 int sendFileToFtp(String imageFileName){
-  String putCommand = String("+CFTPSPUTFILE=") + "\"" + imageFileName + "\"," + "3";
+  String putCommand = String("+CFTPSPUTFILE=") + "\"/" + imageFileName + "\"," + "3";
   modem.sendAT(putCommand);
   if (modem.waitResponse(20000) != 1) {
     ESP_LOGI(TAG, "Failed to run putfile");
@@ -160,7 +169,7 @@ boolean sendFileToEFS(String imageFileName, camera_fb_t * fb) {
   uploadCommand = uploadCommand + "\"e:/" + imageFileName + "\"," + len;
   ESP_LOGI(TAG, "upload command: %s", uploadCommand.c_str());
   modem.sendAT(uploadCommand);
-  if (modem.waitResponse(5000) != 1) { // TODO: fix waiting for the '>' start
+  if (modem.waitResponse(2000) != 1) { // TODO: fix waiting for the '>' start
     // ESP_LOGI(TAG, "Failed to start file upload to EFS");
   }
 
@@ -176,10 +185,15 @@ boolean sendFileToEFS(String imageFileName, camera_fb_t * fb) {
         ESP_LOGI(TAG, "File successfully written to EFS");
 
         // manual check that file was written
-        modem.sendAT("+FSLS");
-        if (modem.waitResponse(20000) != 1) {
-          ESP_LOGI(TAG, "Failed to check EFS directory");
-        }
+        // modem.sendAT("+FSLS");
+        // if (modem.waitResponse(20000) != 1) {
+        //   ESP_LOGI(TAG, "Failed to check EFS directory");
+        // }
+
+        // modem.sendAT("+FSATTRI="+imageFileName);
+        // if (modem.waitResponse(10000) != 1) {
+        //   ESP_LOGI(TAG, "Failed to check file attributes");
+        // }
         return true;
       }
     }
@@ -200,22 +214,22 @@ boolean sendPhoto(camera_fb_t * fb){
     ESP_LOGI(TAG, "Error while conecting to FTP");
     return false;
   };
-  // int ftpResult = -1;
-  // int retries = 3;
-  // while (ftpResult != 0 && retries >= 0) {
-  //   ftpResult = sendFileToFtp(imageFileName);
-  //   retries--;
-  //   if(ftpResult != 0){
-  //     ESP_LOGI(TAG, "Error sending file to FTP, retrying, number of retires left : %d", retries);
-  //   }
-  // }
-  // stopFtp();
-  // if (ftpResult == 0){
-  //   return true;
-  // } else {
-  //   ESP_LOGI(TAG, "Cannot send file to FTP");
-  //   return false;
-  // }
+  int ftpResult = -1;
+  int retries = 3;
+  while (ftpResult != 0 && retries >= 0) {
+    ftpResult = sendFileToFtp(imageFileName);
+    retries--;
+    if(ftpResult != 0){
+      ESP_LOGI(TAG, "Error sending file to FTP, retrying, number of retires left : %d", retries);
+    }
+  }
+  stopFtp();
+  if (ftpResult == 0){
+    return true;
+  } else {
+    ESP_LOGI(TAG, "Cannot send file to FTP");
+    return false;
+  }
 }
 
 // take photo, process it, and send to server if needed
@@ -253,22 +267,23 @@ void takePhoto() {
   }
 
   if (!sendPhotoOk) {
-    ESP_LOGI(TAG, "Cannot send file to FTP");
     esp_camera_fb_return(fb);
+    ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()));
+    ESP_LOGI(TAG, "Failed to upload photo successfully");
     return;
+  } else {
+    // return the frame buffer back to the driver for reuse
+    esp_camera_fb_return(fb);
+
+    ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()));
+    ESP_LOGI(TAG, "Photo taken and uploaded successfully");
+
+    unsigned int sendTimes = preferences.getUInt("sendTimes", 0);
+    sendTimes++;
+    preferences.putUInt("sendTimes", sendTimes);
+
+    ESP_LOGI(TAG, "Send Times: %d", sendTimes);
   }
-
-  // return the frame buffer back to the driver for reuse
-  esp_camera_fb_return(fb);
-
-  ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()));
-  ESP_LOGI(TAG, "Photo taken and uploaded successfully");
-
-  unsigned int sendTimes = preferences.getUInt("sendTimes", 0);
-  sendTimes++;
-  preferences.putUInt("sendTimes", sendTimes);
-
-  ESP_LOGI(TAG, "Send Times: %d", sendTimes);
 }
 
 // send formatted logfile with sensor information
@@ -368,6 +383,10 @@ void initializeCamera() {
     return;
   }
 
+  // flip image on x axis
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_vflip(s, 1);
+
 // #ifdef CAM_IR_PIN
 //   // test IR Filter
 //   pinMode(CAM_IR_PIN, OUTPUT);
@@ -379,9 +398,9 @@ void initializeCamera() {
 // #endif
 
   // TODO: on during the day, off during the night
-  ESP_LOGI(TAG, "IR Filter Off");
+  ESP_LOGI(TAG, "IR Filter On");
   pinMode(CAM_IR_PIN, OUTPUT);
-  digitalWrite(CAM_IR_PIN, LOW);
+  digitalWrite(CAM_IR_PIN, HIGH);
 
   ESP_LOGI(TAG, "Camera initialized");
 }
@@ -569,7 +588,7 @@ void setup() {
   // initialize NVME
   preferences.begin("image-data", false);
 
-  initializeConnectionWifi();
+  // initializeConnectionWifi();
 
   initializeModem();
 
@@ -580,22 +599,24 @@ void setup() {
   syncTime();
 
   // sendLogFile();
-  // takePhoto();
+  takePhoto();
 }
 
 void loop() {
-  static unsigned long lastPhotoTime = 0;
-  static unsigned long lastReportTime = 0;
+  unsigned long lastPhotoTime = preferences.getULong("lastPhotoTime", 0);
+  unsigned long lastReportTime = preferences.getULong("lastReportTime", 0);
   unsigned long currentTime = millis();
 
- if (currentTime - lastPhotoTime >= 60000) { // 10 minutes = 600000
-    takePhoto();
+ if (currentTime - lastPhotoTime >= 600000) { // 10 minutes = 600000
+   takePhoto();
     lastPhotoTime = currentTime;
+    preferences.putULong("lastPhotoTime", lastPhotoTime);
   }
 
   if (currentTime - lastReportTime >= 86400000) { // 24 hours
-    sendLogFile();
+    // sendLogFile();
     lastReportTime = currentTime;
+    preferences.putULong("lastReportTime", lastReportTime);
   }
 
   delay(5000);

@@ -49,27 +49,53 @@ void syncTime();
 void initializeModem();
 void initializeSDCard();
 int sdCardLogOutput(const char *format, va_list args);
-
+void clearEFS();
 void stopFtp(void);
-String sendATcommand(String toSend, String expectedResponse, unsigned long milliseconds);
-String readLineFromSerial(String stringToRead, unsigned long timeoutMilis);
+boolean initFtp(void);
+int sendFileToFtp(String imageFileName);
+boolean sendFileToEFS(String imageFileName, camera_fb_t * fb);
+boolean sendPhoto(camera_fb_t * fb);
 
 // datetime as string of numbers
 String getCurrentDateTime() {
-  time_t now = time(nullptr);
-  struct tm * timeinfo = localtime(&now);
-  char buffer[30];
-  strftime(buffer, 30, "%d%m%Y%H%M%S", timeinfo);
-  return String(buffer);
+  String time;
+  modem.sendAT("+CCLK?");
+  if (modem.waitResponse(10000, time) != 1) {
+    ESP_LOGI(TAG, "Failed to get time");
+    return "";
+  }
+  time = time.substring(time.indexOf('"') + 1, time.lastIndexOf('"'));
+  int year = time.substring(0, 2).toInt();
+  int month = time.substring(3, 5).toInt();
+  int day = time.substring(6, 8).toInt();
+  int hour = time.substring(9, 11).toInt();
+  int minute = time.substring(12, 14).toInt();
+  int second = time.substring(15, 17).toInt();
+
+  char result[20];
+  snprintf(result, sizeof(result), "%02d%02d20%02d%02d%02d%02d", day, month, year, hour, minute, second);
+  return String(result);
 }
 
 // datetime as human readable string
 String getFormattedDateTime() {
-  time_t now = time(nullptr);
-  struct tm * timeinfo = localtime(&now);
-  char buffer[30];
-  strftime(buffer, 30, "%d/%m/%Y %H:%M:%S", timeinfo);
-  return String(buffer);
+  String time;
+  modem.sendAT("+CCLK?");
+  if (modem.waitResponse(10000, time) != 1) {
+    ESP_LOGI(TAG, "Failed to get time");
+    return "";
+  }
+  time = time.substring(time.indexOf("\"") + 1, time.indexOf("\""));
+  int year = time.substring(0, 2).toInt();
+  int month = time.substring(3, 5).toInt();
+  int day = time.substring(6, 8).toInt();
+  int hour = time.substring(9, 11).toInt();
+  int minute = time.substring(12, 14).toInt();
+  int second = time.substring(15, 17).toInt();
+
+  char result[20];
+  snprintf(result, sizeof(result), "%02d/%02d/20%02d %02d:%02d:%02d", day, month, year, hour, minute, second);
+  return String(result);
 }
 
 // formatted filename for image upload
@@ -91,67 +117,121 @@ String getSDCardInfo() {
   return sdInfo;
 }
 
+String sendATCommand(String command, String desiredResponse, unsigned long timeout) {
+  modem.sendAT(command);
+  String result;
+  unsigned long startTime = millis();
+  boolean ok = false;
+  while (!ok && millis() - startTime < timeout) {
+    String s = modem.stream.readStringUntil('\n');
+    ok = s.indexOf(desiredResponse) >= 0;
+    result += s;
+  }
+  return result;
+}
+
+// delete all files in sim7600 EFS to prevent clutter of images
+void clearEFS() { // TODO: function deletes only one file but should delete all files
+  ESP_LOGI(TAG, "Clearing EFS...");
+
+  // directory for storing all images
+  modem.sendAT("+FSCD=E:");
+  if (modem.waitResponse(10000) != 1) {
+      ESP_LOGI(TAG, "Failed to change directory to E:");
+      return;
+  }
+
+  // list files and delete them
+  modem.sendAT("+FSLS");
+  String response = modem.stream.readStringUntil('\n');
+  ESP_LOGI(TAG, "List of files: %s", response.c_str());
+
+  while (response.indexOf("OK") == -1 && response.indexOf("ERROR") == -1) {
+    response = modem.stream.readStringUntil('\n');
+    ESP_LOGI(TAG, "File: %s", response.c_str());
+
+    // delete all files
+    if (response.indexOf(DEVICENAME) >= 0) {
+      String fileName = response.substring(response.indexOf(DEVICENAME), response.indexOf('\n'));
+      fileName.trim();
+
+      String deleteCommand = "+FSDEL=" + fileName;
+      modem.sendAT(deleteCommand.c_str());
+      if (modem.waitResponse(5000) != 1) {
+          ESP_LOGI(TAG, "Failed to delete file: %s", fileName.c_str());
+      } else {
+          ESP_LOGI(TAG, "Deleted file: %s", fileName.c_str());
+      }
+    }
+  }
+
+  ESP_LOGI(TAG, "EFS cleared");
+}
+
+
 // start FTP service on modem and login
 boolean initFtp(void) {
-  String result;
-
-  modem.sendAT("+CFTPSSTART");
-  modem.waitResponse(2000);
-  if(modem.waitResponse(10000) != 0) {
+  String response = sendATCommand("+CFTPSSTART", "+CFTPSSTART:", 10000);
+  if (response.indexOf("ERROR") > 0) {
     ESP_LOGI(TAG, "Failed to start FTP service on modem");
-    return false;
-  }
-  else {
+    stopFtp();
+    sendATCommand("+CFTPSSTART", "OK", 5000);
+  } else {
     ESP_LOGI(TAG, "Started FTP service on modem");
   }
 
-  modem.sendAT("+CFTPSLOGIN=\"", FTP_SERVER, ("\","), FTP_PORT,(",\""), FTP_USER,("\",\""), FTP_PASS,("\","),0);
-  if (modem.waitResponse(2000) != 1) {
+  String loginCommand = String("+CFTPSLOGIN=\"") + FTP_SERVER + "\"," + String(FTP_PORT) + ",\"" + FTP_USER + "\",\"" + FTP_PASS + "\",0";
+  response = sendATCommand(loginCommand, "+CFTPSLOGIN:", 20000);
+  if (response.indexOf("CFTPSLOGIN: 0") > 0) {
+    ESP_LOGI(TAG, "Logged in FTP");
+  } else {
     ESP_LOGI(TAG, "Failed to login FTP");
     return false;
   }
-  else {
-    ESP_LOGI(TAG, "Logged in FTP");
-  }
 
-  modem.sendAT("+CFTPTYPE=I");
-  modem.waitResponse(2000, result);
-  ESP_LOGI(TAG, "%s", result.c_str());
-  if (modem.waitResponse(10000) != 1) {
-    ESP_LOGI(TAG, "Failed to set FTP type");
-  }
+  // modem.sendAT("+CFTPTYPE=I");
+  // // modem.waitResponse(2000, result);
+  // if (modem.waitResponse(5000) != 1) {
+  //   ESP_LOGI(TAG, "Failed to set FTP type");
+  // }
 
-  modem.sendAT("+CFTPSCWD=\"/\"");
-  modem.waitResponse(2000, result);
-  ESP_LOGI(TAG, "%s", result.c_str());
-  if (modem.waitResponse(10000) != 1) {
-    ESP_LOGI(TAG, "Failed to set FTP folder");
-  }
+  // modem.sendAT("+CFTPSCWD=\"/\"");
+  // // modem.waitResponse(2000, result);
+  // if (modem.waitResponse(5000) != 1) {
+  //   ESP_LOGI(TAG, "Failed to set FTP folder");
+  // }
 
   return true;
 }
 
 // logout and stop FTP service on modem
-void stopFtp(void){
-  modem.sendAT("+CFTPSLOGOUT");
-  if (modem.waitResponse(20000) != 1) {
-    ESP_LOGI(TAG, "Failed to logout FTP");
+void stopFtp(void) {
+  String response = sendATCommand("+CFTPSLOGOUT", "+CTFPSLOGOUT:", 2000);
+  if (response.indexOf("+CFTPSLOGOUT: 0") >= 0) {
+    ESP_LOGI(TAG, "Logged out FTP");
+  } else {
+    ESP_LOGI(TAG, "Failed to log out FTP");
   }
-  modem.sendAT("+CFTPSSTOP");
-  if (modem.waitResponse(20000) != 1) {
-    ESP_LOGI(TAG, "Failed to stop FTP");
+
+  response = sendATCommand("+CFTPSSTOP", "+CFTPSSTOP:", 2000);
+  if (response.indexOf("+CFTPSSTOP: 0") >= 0) {
+    ESP_LOGI(TAG, "Stopped FTP service on modem");
+  } else {
+    ESP_LOGI(TAG, "Failed to stop FTP service on modem");
   }
 }
 
 // send file to FTP server (must be logged in first)
-int sendFileToFtp(String imageFileName){
+int sendFileToFtp(String imageFileName) {
   String putCommand = String("+CFTPSPUTFILE=") + "\"/" + imageFileName + "\"," + "3";
-  modem.sendAT(putCommand);
-  if (modem.waitResponse(20000) != 1) {
-    ESP_LOGI(TAG, "Failed to run putfile");
+  String response = sendATCommand(putCommand, "+CFTPSPUTFILE:", 100000);
+  if (response.indexOf("+CFTPSPUTFILE: 0") >= 0) {
+    ESP_LOGI(TAG, "Successfully ran FTP putfile");
+    return 0;
+  } else {
+    ESP_LOGI(TAG, "Failed to run putfile and upload file to ftp");
+    return -1;
   }
-
-  return 0;
 }
 
 // copy camera data to modem EFS sd card
@@ -169,15 +249,15 @@ boolean sendFileToEFS(String imageFileName, camera_fb_t * fb) {
   uploadCommand = uploadCommand + "\"e:/" + imageFileName + "\"," + len;
   ESP_LOGI(TAG, "upload command: %s", uploadCommand.c_str());
   modem.sendAT(uploadCommand);
-  if (modem.waitResponse(2000) != 1) { // TODO: fix waiting for the '>' start
-    // ESP_LOGI(TAG, "Failed to start file upload to EFS");
+  if (modem.waitResponse(2000) != 0) { // TODO: fix waiting for the '>' start
+    ESP_LOGI(TAG, "Failed to start file upload to EFS");
   }
 
   modem.stream.write(fbBuf, len);
   modem.stream.flush();
-  // Wait for the OK response
+  // wait for the OK response
   unsigned long startTime = millis();
-  while (millis() - startTime < 15000) { // Adjust the timeout as necessary
+  while (millis() - startTime < 25000) { // timeout for file transfer to EFS
     if (modem.stream.available()) {
       String response = modem.stream.readStringUntil('\n');
       ESP_LOGI(TAG, "Response: %s", response.c_str());
@@ -190,10 +270,6 @@ boolean sendFileToEFS(String imageFileName, camera_fb_t * fb) {
         //   ESP_LOGI(TAG, "Failed to check EFS directory");
         // }
 
-        // modem.sendAT("+FSATTRI="+imageFileName);
-        // if (modem.waitResponse(10000) != 1) {
-        //   ESP_LOGI(TAG, "Failed to check file attributes");
-        // }
         return true;
       }
     }
@@ -204,7 +280,7 @@ boolean sendFileToEFS(String imageFileName, camera_fb_t * fb) {
 }
 
 // copy file to modem and send it to FTP server
-boolean sendPhoto(camera_fb_t * fb){
+boolean sendPhoto(camera_fb_t * fb) {
   String imageFileName = getFormattedImageName();
   if (!sendFileToEFS(imageFileName, fb)){
     ESP_LOGI(TAG, "Error while sending file to EFS. Is SD card ok ?");
@@ -247,7 +323,7 @@ void takePhoto() {
     ESP_LOGI(TAG, "Total Pictures: %d", totalPictures);
   }
 
-  // send to FTP server over WIFI
+  // send image over WIFI
   // ftp.OpenConnection();
   // ftp.InitFile("Type I");
   // ftp.ChangeWorkDir("/");
@@ -257,7 +333,7 @@ void takePhoto() {
   // ftp.CloseFile();
   // ftp.CloseConnection();
 
-  // send to FTP server over GSM
+  // send image over 4G
   boolean sendPhotoOk = false;
   for (int i=0; i<3; i++) {
     sendPhotoOk = sendPhoto(fb);
@@ -307,15 +383,19 @@ void sendLogFile() {
 
   ESP_LOGI(TAG, "Log Content:\n%s", LogContent.c_str());
 
-  ftp.OpenConnection();
-  ftp.InitFile("Type I");
-  ftp.ChangeWorkDir("/");
-  String fileName = getFormattedReportName();
-  ftp.NewFile(fileName.c_str());
-  unsigned char *data = (unsigned char *)LogContent.c_str();
-  ftp.WriteData(data, LogContent.length());
-  ftp.CloseFile();
-  ftp.CloseConnection();
+  // send logfile over WiFI
+  // ftp.OpenConnection();
+  // ftp.InitFile("Type I");
+  // ftp.ChangeWorkDir("/");
+  // String fileName = getFormattedReportName();
+  // ftp.NewFile(fileName.c_str());
+  // unsigned char *data = (unsigned char *)LogContent.c_str();
+  // ftp.WriteData(data, LogContent.length());
+  // ftp.CloseFile();
+  // ftp.CloseConnection();
+
+  // send logfile over 4G
+
 
   ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()).c_str());
   ESP_LOGI(TAG, "Daily report generated and uploaded successfully");
@@ -361,14 +441,16 @@ void initializeCamera() {
   // config.vertical_flip = false;
 
   if (psramFound()) {
-      config.frame_size = FRAMESIZE_XGA; // change for better resolution. do not go above QVGA size when not jpeg
-      config.jpeg_quality = 10; // 0-63 with lower number is better quality
-      config.fb_count = 2;
+    ESP_LOGI(TAG, "Using Framesize UXGA");
+    config.frame_size = FRAMESIZE_UXGA; // change for better resolution. do not go above QVGA size when not jpeg
+    config.jpeg_quality = 10; // 0-63 with lower number is better quality
+    config.fb_count = 2;
   } else {
-      config.frame_size = FRAMESIZE_SVGA;
-      config.jpeg_quality = 12;
-      config.fb_count = 1;
-      config.fb_location = CAMERA_FB_IN_DRAM;
+    ESP_LOGI(TAG, "Using Framesize SVGA");
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_DRAM;
   }
 
 #if defined(CAMERA_MODEL_ESP_EYE)
@@ -482,14 +564,34 @@ void getIMEI() {
 // ensure time is set
 void syncTime() {
   ESP_LOGI(TAG, "Syncing Time...");
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  setenv("TZ", "UTC-2", 1); // UTC+2
-  tzset();
-  while (time(nullptr) < 8 * 3600 * 2) { // wait for time to be set
-    delay(500);
-    ESP_LOGI(TAG, "Syncing Time...");
+
+  modem.sendAT("+CTZU=1");
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to enable automatic time update");
   }
-  ESP_LOGI(TAG, "Time synced");
+
+  modem.sendAT("+CNTP=\"pool.ntp.org\",8");
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to set NTP server");
+    return;
+  }
+  modem.sendAT("+CNTP");
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to sync time");
+  }
+
+  // timezone
+  setenv("TZ", "UTC-2", 1);
+  tzset();
+
+  String response = "";
+  modem.sendAT("+CCLK?");
+  if (modem.waitResponse(10000, response) != 1) {
+    ESP_LOGI(TAG, "Failed to get time");
+  }
+
+  String time = response.substring(response.indexOf('"') + 1, response.lastIndexOf('"'));
+  ESP_LOGI(TAG, "Time synced. Current datetime in yy/MM/dd,hh:mm:ss+zz is %s", time.c_str());
 }
 
 // initiale the T-PCIE modem
@@ -508,15 +610,17 @@ void initializeModem() {
   ESP_LOGI(TAG, "Initialized modem");
 
   // register network
-  // String result;
-  // while(true) {
-  //   Serial.println("Waiting for network...");
-  //   result = sendATcommand("AT+CREG?","+CREG: 0,1", 5000);
-  //   if (result.indexOf("+CREG: 0,1") > 0) {
-  //     break;
-  //   }
-  //   delay(2000);
-  // }
+  String result;
+  while(true) {
+    Serial.println("Waiting for network...");
+    modem.sendAT("+CREG?");
+    if (modem.waitResponse(5000, result) == 1) {
+      if (result.indexOf("+CREG: 0,1") > 0 || result.indexOf("+CREG: 0,5") > 0) {
+        break;
+      }
+    }
+    delay(2000);
+  }
 
   // set to GSM mode
   modem.sendAT("+CNMP=38");
@@ -594,30 +698,35 @@ void setup() {
 
   getIMEI();
 
+  clearEFS();
+
   initializeCamera();
 
   syncTime();
 
   // sendLogFile();
-  takePhoto();
+  // takePhoto();
 }
 
 void loop() {
-  unsigned long lastPhotoTime = preferences.getULong("lastPhotoTime", 0);
-  unsigned long lastReportTime = preferences.getULong("lastReportTime", 0);
+  // unsigned long lastPhotoTime = preferences.getULong("lastPhotoTime", 0);
+  // unsigned long lastReportTime = preferences.getULong("lastReportTime", 0);
+  // unsigned long currentTime = getCurrentTime();
+  static unsigned long lastPhotoTime = 0;
+  static unsigned long lastReportTime = 0;
   unsigned long currentTime = millis();
 
- if (currentTime - lastPhotoTime >= 600000) { // 10 minutes = 600000
-   takePhoto();
+  if (currentTime - lastPhotoTime >= 600000) { // 10 minutes = 600 seconds = 600000 millis
+    takePhoto();
     lastPhotoTime = currentTime;
-    preferences.putULong("lastPhotoTime", lastPhotoTime);
+    // preferences.putULong("lastPhotoTime", lastPhotoTime);
   }
 
-  if (currentTime - lastReportTime >= 86400000) { // 24 hours
+  if (currentTime - lastReportTime >= 86400000) { // 24 hours = 86400 seconds = 86400000 millis
     // sendLogFile();
     lastReportTime = currentTime;
-    preferences.putULong("lastReportTime", lastReportTime);
+    // preferences.putULong("lastReportTime", lastReportTime);
   }
 
-  delay(5000);
+  delay(10000);
 }

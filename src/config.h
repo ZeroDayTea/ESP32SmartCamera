@@ -1,9 +1,15 @@
 #ifndef __CONFIG_H__
 #define __CONFIG_H__
 
-#define DEVICENAME "sanwildtest"
+#define DEVICENAME "sanwildtest11"
 #define LOG_FILE_NAME "/log.txt"
+#define FIRMWARE_FILE_NAME "/firmware.bin"
 #define TAG "SmartCamera"
+
+#define OTA_UPDATE_URL "http://13.246.234.82/"
+#define OTA_UPDATE_PORT 80
+#define OTA_UPDATE_ENDPOINT String("") + DEVICENAME + "-firmware.bin"
+#define OTA_VERSION_ENDPOINT String("") + DEVICENAME + "-version.txt"
 
 #define SerialAT Serial1
 // #define DUMP_AT_COMMANDS

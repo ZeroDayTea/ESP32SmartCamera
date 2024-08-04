@@ -1,5 +1,5 @@
-#include <stdarg.h>
-#include <stdio.h>
+// #include <stdarg.h>
+// #include <stdio.h>
 #include <WiFi.h>
 #include <ESP32_FTPClient.h>
 #include <esp_camera.h>
@@ -11,13 +11,14 @@
 #include <HardwareSerial.h>
 #include <StreamDebugger.h>
 #include <TinyGsmClient.h>
+#include <ArduinoHttpClient.h>
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
 #include <Preferences.h>
+#include <Update.h>
 
-// configurations defined in config.h
-ESP32_FTPClient ftp (FTP_SERVER, FTP_USER, FTP_PASS, 20000);
+// globals
 #ifdef DUMP_AT_COMMANDS
   StreamDebugger debugger(SerialAT, Serial);
 #endif
@@ -26,10 +27,15 @@ ESP32_FTPClient ftp (FTP_SERVER, FTP_USER, FTP_PASS, 20000);
 #else
   TinyGsm modem(SerialAT);
 #endif
+
+TinyGsmClient client(modem);
+HttpClient http(client, OTA_UPDATE_URL, OTA_UPDATE_PORT);
 File log_file;
+
 String IMEI = "";
 String GPSPosition = "";
 String LogContent = "";
+String newFirmwareVersion = "";
 Preferences preferences;
 
 // function prototypes
@@ -131,7 +137,7 @@ String sendATCommand(String command, String desiredResponse, unsigned long timeo
 }
 
 // delete all files in sim7600 EFS to prevent clutter of images
-void clearEFS() { // TODO: function deletes only one file but should delete all files
+void clearEFS() {
   ESP_LOGI(TAG, "Clearing EFS...");
 
   // directory for storing all images
@@ -141,31 +147,17 @@ void clearEFS() { // TODO: function deletes only one file but should delete all 
       return;
   }
 
-  // list files and delete them
   modem.sendAT("+FSLS");
-  String response = modem.stream.readStringUntil('\n');
-  ESP_LOGI(TAG, "List of files: %s", response.c_str());
-
-  while (response.indexOf("OK") == -1 && response.indexOf("ERROR") == -1) {
-    response = modem.stream.readStringUntil('\n');
-    ESP_LOGI(TAG, "File: %s", response.c_str());
-
-    // delete all files
-    if (response.indexOf(DEVICENAME) >= 0) {
-      String fileName = response.substring(response.indexOf(DEVICENAME), response.indexOf('\n'));
-      fileName.trim();
-
-      String deleteCommand = "+FSDEL=" + fileName;
-      modem.sendAT(deleteCommand.c_str());
-      if (modem.waitResponse(5000) != 1) {
-          ESP_LOGI(TAG, "Failed to delete file: %s", fileName.c_str());
-      } else {
-          ESP_LOGI(TAG, "Deleted file: %s", fileName.c_str());
-      }
-    }
+  if (modem.waitResponse(5000) != 1) {
+    ESP_LOGI(TAG, "Failed to check EFS file listing");
   }
 
-  ESP_LOGI(TAG, "EFS cleared");
+  modem.sendAT("+FSDEL=*.*");
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to delete image files");
+  } else {
+    ESP_LOGI(TAG, "Successfully cleared EFS");
+  }
 }
 
 
@@ -260,7 +252,7 @@ boolean sendFileToEFS(String imageFileName, camera_fb_t * fb) {
   while (millis() - startTime < 25000) { // timeout for file transfer to EFS
     if (modem.stream.available()) {
       String response = modem.stream.readStringUntil('\n');
-      ESP_LOGI(TAG, "Response: %s", response.c_str());
+      // ESP_LOGI(TAG, "Response: %s", response.c_str());
       if (response.indexOf("OK") != -1) {
         ESP_LOGI(TAG, "File successfully written to EFS");
 
@@ -315,13 +307,11 @@ void takePhoto() {
     ESP_LOGI(TAG, "Camera capture failed");
     return;
   }
-  else {
-    unsigned int totalPictures = preferences.getUInt("totalPictures", 0);
-    totalPictures++;
-    preferences.putUInt("totalPictures", totalPictures);
+  //   unsigned int totalPictures = preferences.getUInt("totalPictures", 0);
+  //   totalPictures++;
+  //   preferences.putUInt("totalPictures", totalPictures);
 
-    ESP_LOGI(TAG, "Total Pictures: %d", totalPictures);
-  }
+  //   ESP_LOGI(TAG, "Total Pictures: %d", totalPictures);
 
   // send image over WIFI
   // ftp.OpenConnection();
@@ -333,33 +323,38 @@ void takePhoto() {
   // ftp.CloseFile();
   // ftp.CloseConnection();
 
-  // send image over 4G
-  boolean sendPhotoOk = false;
-  for (int i=0; i<3; i++) {
-    sendPhotoOk = sendPhoto(fb);
-    if (sendPhotoOk) {
-      break;
+  // send image over 4G if interesting
+  int chance = random(100);
+  // ESP_LOGI(TAG, "random number generated: %d", chance);
+  if(chance == 1) {
+    boolean sendPhotoOk = false;
+    for (int i=0; i<3; i++) {
+      sendPhotoOk = sendPhoto(fb);
+      if (sendPhotoOk) {
+        break;
+      }
+    }
+
+    if (!sendPhotoOk) {
+      esp_camera_fb_return(fb);
+      ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()));
+      ESP_LOGI(TAG, "Failed to upload photo successfully");
+      return;
+    } else {
+      // return the frame buffer back to the driver for reuse
+      esp_camera_fb_return(fb);
+
+      ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()));
+      ESP_LOGI(TAG, "Photo taken and uploaded successfully");
+
+      unsigned int sendTimes = preferences.getUInt("sendTimes", 0);
+      sendTimes++;
+      preferences.putUInt("sendTimes", sendTimes);
+
+      ESP_LOGI(TAG, "Send Times: %d", sendTimes);
     }
   }
-
-  if (!sendPhotoOk) {
-    esp_camera_fb_return(fb);
-    ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()));
-    ESP_LOGI(TAG, "Failed to upload photo successfully");
-    return;
-  } else {
-    // return the frame buffer back to the driver for reuse
-    esp_camera_fb_return(fb);
-
-    ESP_LOGI(TAG, "Time: %s", String(esp_timer_get_time()));
-    ESP_LOGI(TAG, "Photo taken and uploaded successfully");
-
-    unsigned int sendTimes = preferences.getUInt("sendTimes", 0);
-    sendTimes++;
-    preferences.putUInt("sendTimes", sendTimes);
-
-    ESP_LOGI(TAG, "Send Times: %d", sendTimes);
-  }
+  esp_camera_fb_return(fb);
 }
 
 // send formatted logfile with sensor information
@@ -368,7 +363,7 @@ void sendLogFile() {
   getGPSPosition(); // update GPS position data
 
   unsigned int sendTimes = preferences.getUInt("sendTimes", 0);
-  unsigned int totalPictures = preferences.getUInt("totalPictures", 0);
+  // unsigned int totalPictures = preferences.getUInt("totalPictures", 0);
 
   LogContent = "IMEI:" + IMEI + "\n";
   LogContent += "CSQ:12\n";
@@ -377,7 +372,7 @@ void sendLogFile() {
   LogContent += "Date:" + formattedDateTime + "\n";
   LogContent += "Bat:100%\n";
   LogContent += getSDCardInfo() + "\n";
-  LogContent += "Total:" + String(totalPictures) + "\n";
+  LogContent += "Total:" + String("0") + "\n";
   LogContent += "Send:" + String(sendTimes) + "\n";
   LogContent += "GPS:" + GPSPosition + "\n";
 
@@ -402,15 +397,15 @@ void sendLogFile() {
 }
 
 // connect to WiFi
-void initializeConnectionWifi() {
-  ESP_LOGI(TAG, "Connecting to WiFi...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    ESP_LOGI(TAG, "Connecting to WiFi...");
-  }
-  ESP_LOGI(TAG, "Connected to WiFi");
-}
+// void initializeConnectionWifi() {
+//   ESP_LOGI(TAG, "Connecting to WiFi...");
+//   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+//   while (WiFi.status() != WL_CONNECTED) {
+//     delay(1000);
+//     ESP_LOGI(TAG, "Connecting to WiFi...");
+//   }
+//   ESP_LOGI(TAG, "Connected to WiFi");
+// }
 
 // initialize the camera
 void initializeCamera() {
@@ -438,7 +433,6 @@ void initializeCamera() {
   config.pin_reset = CAM_RESET_PIN;
   config.xclk_freq_hz = 20000000; // EXPERIMENTAL: Set to 16MHz on ESP32-S2 or ESP32-S3 to enable EDMA mode
   config.pixel_format = PIXFORMAT_JPEG; // YUV422,GRAYSCALE,RGB565,JPEG
-  // config.vertical_flip = false;
 
   if (psramFound()) {
     ESP_LOGI(TAG, "Using Framesize UXGA");
@@ -465,19 +459,12 @@ void initializeCamera() {
     return;
   }
 
-  // flip image on x axis
   sensor_t *s = esp_camera_sensor_get();
+  // daytime settings
   s->set_vflip(s, 1);
 
-// #ifdef CAM_IR_PIN
-//   // test IR Filter
-//   pinMode(CAM_IR_PIN, OUTPUT);
-//   ESP_LOGI(TAG, "Test IR Filter");
-//   int i = 3;
-//   while (i--) {
-//     digitalWrite(CAM_IR_PIN, 1 - digitalRead(CAM_IR_PIN)); delay(1000);
-//   }
-// #endif
+  // nighttime settings
+  // s->set_vflip(s, 1);
 
   // TODO: on during the day, off during the night
   ESP_LOGI(TAG, "IR Filter On");
@@ -675,11 +662,169 @@ void initializeSDCard() {
   }
 }
 
+// check if firmware update is necessary
+bool checkForUpdate() {
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to initialize HTTP");
+    return false;
+  }
+
+  modem.sendAT(String("+HTTPPARA=\"URL\",\"") + OTA_UPDATE_URL + OTA_VERSION_ENDPOINT + "\"");
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to set URL");
+    return false;
+  }
+
+  String response = sendATCommand("+HTTPACTION=0", "+HTTPACTION: 0,200", 20000);
+
+  response = sendATCommand("+HTTPREAD=99", "+HTTPREAD: 0", 20000);
+  response = response.substring(22, 28); // splice out the version number
+
+  modem.sendAT("+HTTPTERM");
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to disable HTTP service");
+  }
+
+  ESP_LOGI(TAG, "Response: %s", response.c_str());
+
+  String currentVersion = preferences.getString("firmwareVersion", "");
+  if (response != currentVersion) {
+    ESP_LOGI(TAG, "New firmware version available");
+    newFirmwareVersion = response;
+    return true;
+  }
+
+  ESP_LOGI(TAG, "No new firmware version available");
+  return false;
+}
+
+// download firmware file from remote server to SD card
+bool downloadFirmware() {
+  const int chunkSize = 1024;
+
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to initialize HTTP");
+    return false;
+  }
+
+  modem.sendAT(String("+HTTPPARA=\"URL\",\"") + OTA_UPDATE_URL + OTA_UPDATE_ENDPOINT + "\"");
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to set URL");
+    return false;
+  }
+
+  // GET request
+  String response = sendATCommand("+HTTPACTION=0", "+HTTPACTION: 0,200", 20000);
+
+  // int fileLength = response.substring(24, response.length() - 1).toInt(); // parse out the length returned after code 200
+  // ESP_LOGI(TAG, "File Length To Download: %d", fileLength);
+
+  File firmware = SD.open(FIRMWARE_FILE_NAME, FILE_WRITE);
+  if (!firmware) {
+    ESP_LOGI(TAG, "Failed to open file for writing");
+    return false;
+  }
+
+  // read the firmware file in chunks
+  int bytesRead = 0;
+  while (true) {
+    String readCommand = String("+HTTPREAD=") + bytesRead + "," + chunkSize;
+    // String response = sendATCommand(readCommand, "+HTTPREAD: 0", 10000);
+
+    // modified sendATCommand to prevent newline stripping
+    modem.sendAT(readCommand);
+    String response;
+    unsigned long startTime = millis();
+    boolean ok = false;
+    while (!ok && millis() - startTime < 10000) {
+      String s = modem.stream.readStringUntil('\n');
+      ok = s.indexOf("+HTTPREAD: 0") >= 0;
+      response += s + '\n';
+    }
+    response.remove(response.length() - 1, 1);
+
+    if (response.indexOf("+HTTPREAD:") == -1) {
+      ESP_LOGI(TAG, "Failed to read HTTP chunk");
+      firmware.close();
+      return false;
+    }
+
+    // extract the data part from the response
+    int startIndex = response.indexOf('\r', response.indexOf("+HTTPREAD:")) + 2;
+    int endIndex = response.length() - 15; // parse out the +HTTPREAD: 0 at end
+    String chunk = response.substring(startIndex, endIndex);
+    firmware.print(chunk);
+    firmware.flush();
+    bytesRead += chunk.length();
+
+    // if returned data is shorter than chunk size then finished
+    String dataSize = response.substring(response.indexOf("DATA,") + 5);
+    int dataSizeInt = dataSize.substring(0, dataSize.indexOf('\r')).toInt();
+
+    // Check if we have read all the data
+    if (dataSizeInt < chunkSize) {
+      break;
+    }
+  }
+
+  // Close the file
+  firmware.flush();
+  firmware.close();
+
+  modem.sendAT("+HTTPTERM");
+  if (modem.waitResponse(10000) != 1) {
+    ESP_LOGI(TAG, "Failed to disable HTTP service");
+  }
+
+  ESP_LOGI(TAG, "Firmware downloaded successfully");
+  return true;
+}
+
+// flash new firmware from SD card
+void applyFirmware() {
+  File firmware = SD.open(FIRMWARE_FILE_NAME, FILE_READ);
+  if (!firmware) {
+    ESP_LOGI(TAG, "Failed to open firmware file");
+    return;
+  }
+
+  size_t firmwareSize = firmware.size();
+
+  if (!Update.begin(firmwareSize)) {
+    ESP_LOGI(TAG, "Failed to start update");
+    return;
+  }
+
+  size_t written = Update.writeStream(firmware);
+  if (written == firmwareSize) {
+    ESP_LOGI(TAG, "Written : %d successfully", written);
+  } else {
+    ESP_LOGI(TAG, "Written only : %d/%d", written, firmwareSize);
+  }
+
+  if (Update.end()) {
+    ESP_LOGI(TAG, "OTA done!");
+    if (Update.isFinished()) {
+      ESP_LOGI(TAG, "Update successfully completed. Rebooting.");
+      preferences.putString("firmwareVersion", newFirmwareVersion);
+      ESP.restart();
+    } else {
+      ESP_LOGI(TAG, "Update not finished? Something went wrong!");
+    }
+  } else {
+    ESP_LOGI(TAG, "Error #: %d", Update.getError());
+  }
+
+  firmware.close();
+}
+
 void setup() {
   pinMode(PWR_ON_PIN, OUTPUT);
   digitalWrite(PWR_ON_PIN, HIGH);
   delay(100);
-  Serial2.begin(115200, SERIAL_8N1, PCIE_RX_PIN, PCIE_TX_PIN);
+  // Serial2.begin(115200, SERIAL_8N1, PCIE_RX_PIN, PCIE_TX_PIN);
   Serial.begin(115200);
   delay(10);
   esp_log_level_set("*", ESP_LOG_VERBOSE);
@@ -687,7 +832,11 @@ void setup() {
 
   initializeSDCard();
 
-  ESP_LOGI(TAG, "Starting camera sensor...");
+  ESP_LOGI(TAG, "Starting camera sensor %s...", DEVICENAME);
+
+  // disable WiFi and bluetooth for power consumption
+  WiFi.mode(WIFI_OFF);
+  btStop();
 
   // initialize NVME
   preferences.begin("image-data", false);
@@ -700,6 +849,13 @@ void setup() {
 
   clearEFS();
 
+  // OTA updates
+  if (checkForUpdate()) {
+    if (downloadFirmware()) {
+      applyFirmware();
+    }
+  }
+
   initializeCamera();
 
   syncTime();
@@ -709,24 +865,31 @@ void setup() {
 }
 
 void loop() {
-  // unsigned long lastPhotoTime = preferences.getULong("lastPhotoTime", 0);
   // unsigned long lastReportTime = preferences.getULong("lastReportTime", 0);
   // unsigned long currentTime = getCurrentTime();
-  static unsigned long lastPhotoTime = 0;
   static unsigned long lastReportTime = 0;
+  static unsigned long lastOTACheckTime = 0;
   unsigned long currentTime = millis();
 
-  if (currentTime - lastPhotoTime >= 600000) { // 10 minutes = 600 seconds = 600000 millis
-    takePhoto();
-    lastPhotoTime = currentTime;
-    // preferences.putULong("lastPhotoTime", lastPhotoTime);
-  }
+  takePhoto();
 
   if (currentTime - lastReportTime >= 86400000) { // 24 hours = 86400 seconds = 86400000 millis
-    // sendLogFile();
     lastReportTime = currentTime;
     // preferences.putULong("lastReportTime", lastReportTime);
+    // sendLogFile();
   }
+
+  if (currentTime - lastOTACheckTime >= 86400000) {
+    lastOTACheckTime = currentTime;
+
+    if (checkForUpdate()) {
+      if (downloadFirmware()) {
+        applyFirmware();
+      }
+    }
+  }
+
+  // ESP_LOGI(TAG, "Heap: %d/%d, PSRAM: %d/%d", (ESP.getHeapSize() - ESP.getFreeHeap()), ESP.getHeapSize(), (ESP.getPsramSize() - ESP.getFreePsram()), ESP.getPsramSize());
 
   delay(10000);
 }
